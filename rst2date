@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Archive IFS-FESOM restarts by date and link them into views that storylines4extremes reads.
+
+Bundles up to DE_CY48R1.0_climateDT_20260326 (RAPS 0.1.17) keep restarts/<SDATE>/<member>/<N>/,
+where N/ holds the state at the start of chunk N. Newer RAPS and the storyline reruns want one
+directory per restart date instead. The date of each chunk dir is read from the restart itself:
+the experiment start from the BLS/LAW file names plus rcf CTIME, checked against fesom.clock.
+Sources are only read and stay as they are. The archive keeps every source run apart:
+
+  <archive>/by-expid/<expid>/<member>/<YYYYMMDD>/    converted restarts, one tree per source run
+  <archive>/<view>/<scenario>/<member>/<YYYYMMDD>    links; a view is a RESTART_ROOT for
+                                                     storylines4extremes, one source per slot
+
+  rst2date <hpcroot>/<expid>/restarts/<SDATE> <archive>                  dry run, every member
+  rst2date <hpcroot>/<expid>/restarts/<SDATE> <archive> --view <view> --scenario hist --apply
+  rst2date <dated-root>/cont <archive> --view <view> --scenario cont --apply   link as it is
+  rst2date <src> <archive> --members fc0 --chunks 2-4 --mode copy --apply
+
+<src> is an SDATE dir (all members), one member dir, or an already dated tree (<member>/<date>/),
+which is only linked into the view. Members and the expid come from the path (--expid overrides).
+Dry run by default; --apply builds each date dir under a temporary name, then moves it into place.
+A view slot that already points elsewhere is refused, never replaced.
+
+Each date dir gets rcf, waminfo, LAW*/BLS*/srf*, fesom_raw_restart/ and fesom.clock at the top
+level, where FESOM >= DE2.6.9 and the RAPS restart check look for it. Not carried: RAPS's own
+copies of the next restart (rcf_<hours>_<jobid>, waminfo_..., fesom_raw_restart_...), which
+belong to the next chunk dir's date. A symlinked archive only lives as long as the source does.
+"""
+
+import argparse
+import datetime
+import os
+import re
+import shutil
+import sys
+
+TASK_FILE = re.compile(r"^(?:(?:LAW|BLS)\d{14}_\d+\.\d+_\d+|srf\d+\.\d+)$")
+START = re.compile(r"^(?:LAW|BLS)(\d{14})_")
+CTIME = re.compile(r'CTIME\s*=\s*"\s*(\d{10})')
+NP_DIR = re.compile(r"^np(\d+)$")
+DATE_DIR = re.compile(r"^\d{8}(?:_\d{6}Z)?$")
+STORE = "by-expid"
+
+
+def die(msg, code=2):
+    print("rst2date: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_chunks(spec):
+    chunks = set()
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        try:
+            chunks.update(range(int(lo), int(hi or lo) + 1))
+        except ValueError:
+            die("bad --chunks value: " + spec)
+    return chunks
+
+
+def fesom_clock_date(path):
+    """Line 2 of fesom.clock is '<seconds> <day of year> <year>' of the restart time."""
+    with open(path) as f:
+        lines = f.read().split("\n")
+    secs, doy, year = lines[1].split()
+    return (datetime.datetime(int(year), 1, 1)
+            + datetime.timedelta(days=int(doy) - 1, seconds=float(secs)))
+
+
+class Chunk:
+    def __init__(self, path, number):
+        self.path = path
+        self.number = number
+        self.date = None
+        self.problems = []
+        self.carry = []
+        self.left = []
+        self.clock = None
+        self.np = None
+        self.empty = False
+
+    def inspect(self):
+        try:
+            names = sorted(os.listdir(self.path))
+        except OSError as e:
+            self.problems.append(str(e))
+            return
+        if "rcf" not in names:
+            self.empty = True
+            return
+
+        tasks = [n for n in names if TASK_FILE.match(n)]
+        keep = set(tasks) | {"rcf", "waminfo", "fesom_raw_restart"}
+        self.carry = [n for n in names if n in keep]
+        self.left = [n for n in names if n not in keep]
+        if "waminfo" not in names:
+            self.problems.append("no waminfo")
+
+        starts = {START.match(n).group(1) for n in tasks if START.match(n)}
+        if len(starts) != 1:
+            self.problems.append("expected one experiment start in BLS/LAW names, found %d"
+                                 % len(starts))
+            return
+        with open(os.path.join(self.path, "rcf")) as f:
+            m = CTIME.search(f.read())
+        if not m:
+            self.problems.append("no CTIME in rcf")
+            return
+        ctime = m.group(1)  # DDDDDDHHMM since the experiment start
+        start = datetime.datetime.strptime(starts.pop(), "%Y%m%d%H%M%S")
+        self.date = start + datetime.timedelta(
+            days=int(ctime[:6]), hours=int(ctime[6:8]), minutes=int(ctime[8:]))
+
+        raw = os.path.join(self.path, "fesom_raw_restart")
+        for c in (os.path.join(raw, "fesom.clock"), os.path.join(self.path, "fesom.clock")):
+            if os.path.isfile(c):
+                self.clock = c
+                break
+        if not self.clock:
+            self.problems.append("no fesom.clock")
+        else:
+            fdate = fesom_clock_date(self.clock)
+            if fdate != self.date:
+                self.problems.append("fesom.clock says %s, rcf says %s" % (fdate, self.date))
+
+        nps = [int(NP_DIR.match(n).group(1)) for n in os.listdir(raw)
+               if NP_DIR.match(n)] if os.path.isdir(raw) else []
+        if len(nps) != 1:
+            self.problems.append("expected one fesom_raw_restart/np<N>, found %d" % len(nps))
+            return
+        self.np = nps[0]
+        srf = "srf" + ctime + "."
+        for kind, test in (("LAW", lambda n: n.startswith("LAW")),
+                           ("BLS", lambda n: n.startswith("BLS")),
+                           ("srf", lambda n: n.startswith(srf))):
+            count = sum(1 for n in tasks if test(n))
+            if count != self.np:
+                self.problems.append("%d %s files for %d tasks" % (count, kind, self.np))
+        stray = [n for n in tasks if n.startswith("srf") and not n.startswith(srf)]
+        if stray:
+            self.problems.append("%d srf files of another step, e.g. %s" % (len(stray), stray[0]))
+        # what the RAPS pre-run restart check asks of FESOM
+        np_dir = os.path.join(raw, "np%d" % self.np)
+        info = np_dir + ".info"
+        if not (os.path.isfile(info) and os.path.getsize(info)):
+            self.problems.append("no fesom_raw_restart/np%d.info" % self.np)
+        dumps = [n for n in os.listdir(np_dir) if n.endswith(".dump")]
+        empty = [n for n in dumps if not os.path.getsize(os.path.join(np_dir, n))]
+        if len(dumps) != self.np or empty:
+            self.problems.append("%d .dump files (%d empty) for %d tasks"
+                                 % (len(dumps), len(empty), self.np))
+
+    def name(self, fmt):
+        return date_name(self.date, fmt)
+
+
+def date_name(date, fmt):
+    """The dir name of a restart date: YYYYMMDD (00Z only) or the RAPS YYYYMMDD_HHMMSSZ."""
+    if fmt == "raps":
+        return date.strftime("%Y%m%d_%H%M%SZ")
+    if date.time() != datetime.time(0):
+        return None
+    return date.strftime("%Y%m%d")
+
+
+def parse_date_name(name):
+    fmt = "%Y%m%d_%H%M%SZ" if "_" in name else "%Y%m%d"
+    return datetime.datetime.strptime(name, fmt)
+
+
+def place(src, dst, mode):
+    """Hard link, copy or symlink one entry; directories are recreated for link and copy."""
+    if mode == "symlink":
+        os.symlink(os.path.abspath(src), dst)
+    elif os.path.isdir(src):
+        os.mkdir(dst)
+        shutil.copystat(src, dst)
+        for n in os.listdir(src):
+            place(os.path.join(src, n), os.path.join(dst, n), mode)
+    elif mode == "link":
+        os.link(src, dst)
+    else:
+        shutil.copy2(src, dst)
+
+
+def build(chunk, dest, name, mode):
+    final = os.path.join(dest, name)
+    tmp = os.path.join(dest, ".%s.partial-%d" % (name, os.getpid()))
+    os.mkdir(tmp)
+    try:
+        for n in chunk.carry:
+            place(os.path.join(chunk.path, n), os.path.join(tmp, n), mode)
+        if not os.path.lexists(os.path.join(tmp, "fesom.clock")):
+            place(chunk.clock, os.path.join(tmp, "fesom.clock"), mode)
+    except OSError as e:
+        hint = ""
+        if mode == "link" and e.errno in (1, 18):
+            hint = ("\n  hard links need the same GPFS fileset and, for files you do not own, "
+                    "write access to them (fs.protected_hardlinks); use --mode copy or symlink")
+        die("%s: %s, partial result left in %s%s" % (chunk.path, e, tmp, hint), 1)
+    os.rename(tmp, final)
+
+
+def is_chunk(name):
+    return name.isdigit() and len(name) < 8
+
+
+def subdirs(path, test):
+    return sorted(n for n in os.listdir(path)
+                  if test(n) and os.path.isdir(os.path.join(path, n)))
+
+
+def holds_restarts(path):
+    return bool(subdirs(path, is_chunk) or subdirs(path, DATE_DIR.match))
+
+
+def find_members(src):
+    """{member: dir}: src itself when it holds chunk or date dirs, else its subdirs that do."""
+    if holds_restarts(src):
+        return {os.path.basename(os.path.normpath(src)): src}
+    return {m: os.path.join(src, m) for m in subdirs(src, lambda n: True)
+            if holds_restarts(os.path.join(src, m))}
+
+
+def expid_from(src):
+    """The workflow layout is <hpcroot>/<expid>/restarts/<SDATE>/<member>."""
+    parts = os.path.realpath(src).split(os.sep)
+    return parts[parts.index("restarts") - 1] if "restarts" in parts[1:] else None
+
+
+def dated_problems(path):
+    return ["no %s" % f for f in ("rcf", "waminfo", "fesom.clock")
+            if not (os.path.isfile(os.path.join(path, f)) and os.path.getsize(os.path.join(path, f)))]
+
+
+def slot_action(slot, target):
+    """What linking a view slot to target would do."""
+    if not os.path.lexists(slot):
+        return "link", None
+    if os.path.islink(slot) and os.readlink(slot) == target:
+        return "linked", None
+    return None, "view slot taken by " + (os.readlink(slot) if os.path.islink(slot) else "a dir")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("src", help="SDATE dir, member dir, or an already dated tree")
+    ap.add_argument("archive", help="archive root, holds by-expid/ and the views")
+    ap.add_argument("--view", help="view to link into, e.g. storylines-gen2-run1")
+    ap.add_argument("--scenario", help="scenario dir in the view, as storylines4extremes names it")
+    ap.add_argument("--expid", help="source expid, when it is not in the path")
+    ap.add_argument("--members", help="only these members, e.g. fc0,fc4")
+    ap.add_argument("--chunks", help="only these chunk numbers, e.g. 2-4,7")
+    ap.add_argument("--mode", choices=("symlink", "link", "copy"), default="symlink",
+                    help="symlink (default), link: hard links, copy: real copies")
+    ap.add_argument("--format", choices=("date", "raps"), default="date",
+                    help="date: YYYYMMDD (default); raps: YYYYMMDD_HHMMSSZ")
+    ap.add_argument("--apply", action="store_true", help="create the dirs; default is a dry run")
+    args = ap.parse_args()
+
+    if not os.path.isdir(args.src):
+        die("not a directory: " + args.src)
+    if bool(args.view) != bool(args.scenario):
+        die("--view and --scenario go together")
+    src, archive = os.path.realpath(args.src), os.path.realpath(args.archive)
+    if archive == src or archive.startswith(src + os.sep):
+        die("the archive must be outside src, the source tree stays as it is")
+    members = find_members(args.src)
+    if args.members:
+        members = {m: p for m, p in members.items() if m in args.members.split(",")}
+    if not members:
+        die("no member with chunk or date dirs in " + args.src)
+    expid = args.expid or expid_from(args.src)
+    wanted = parse_chunks(args.chunks) if args.chunks else None
+    for member, mdir in members.items():
+        if not args.view and not subdirs(mdir, is_chunk):
+            die("%s is already dated, it can only be linked into a view (--view)" % mdir)
+
+    failed = 0
+    builds, links = [], []
+    print("%-6s %-16s %-20s %-6s %-18s %s"
+          % ("member", "source", "restart date", "tasks", "target", "action"))
+    for member, mdir in sorted(members.items()):
+        view_dir = (os.path.join(archive, args.view, args.scenario, member) if args.view else None)
+        rows = []
+        if subdirs(mdir, is_chunk):
+            if not expid:
+                die("cannot tell the expid from %s, give --expid" % args.src)
+            store = os.path.join(archive, STORE, expid, member)
+            seen = {}
+            for n in subdirs(mdir, is_chunk):
+                if wanted is not None and int(n) not in wanted:
+                    continue
+                c = Chunk(os.path.join(mdir, n), int(n))
+                c.inspect()
+                name = c.name(args.format) if c.date else None
+                if c.date and not name:
+                    c.problems.append("restart is not at 00Z, use --format raps")
+                if name in seen:
+                    c.problems.append("same date as chunk %s" % seen[name])
+                if name:
+                    seen[name] = n
+                if c.empty:
+                    rows.append((n, c, None, None, None, ["no rcf, no restart in it (a cold "
+                                                          "start's chunk 1), left alone"], False))
+                    continue
+                target = os.path.join(store, name) if name else None
+                if not c.problems:
+                    if os.path.lexists(target):
+                        rows.append((n, c, c.date, name, target, ["in store"], True))
+                    else:
+                        builds.append((c, store, name))
+                        rows.append((n, c, c.date, name, target, ["would create in store"], True))
+                else:
+                    rows.append((n, c, c.date, name, None,
+                                 ["SKIP: " + "; ".join(c.problems)], False))
+        else:
+            # the view slot follows --format whatever the source dir is called
+            for item in subdirs(mdir, DATE_DIR.match):
+                path = os.path.abspath(os.path.join(mdir, item))
+                date = parse_date_name(item)
+                name = date_name(date, args.format)
+                problems = dated_problems(path)
+                if not name:
+                    problems.append("restart is not at 00Z, use --format raps")
+                if problems:
+                    rows.append((item, None, date, name, None,
+                                 ["SKIP: " + "; ".join(problems)], False))
+                else:
+                    rows.append((item, None, date, name, path, [], True))
+
+        for item, c, date, name, target, notes, ok in rows:
+            if ok and view_dir:
+                slot = os.path.join(view_dir, name)
+                rel = (os.path.relpath(target, view_dir) if target.startswith(archive + os.sep)
+                       else target)
+                action, problem = slot_action(slot, rel)
+                if problem:
+                    notes.append("SKIP: " + problem)
+                    ok = False
+                elif action == "link":
+                    links.append((slot, rel))
+                    notes.append("would link in view")
+                else:
+                    notes.append("linked in view")
+            failed += not ok and any(x.startswith("SKIP") for x in notes)
+            print("%-6s %-16s %-20s %-6s %-18s %s" % (
+                member, item, date or "-", (c.np if c else None) or "-", name or "-",
+                ", ".join(notes)))
+            if c and c.left:
+                print("       not carried: " + " ".join(c.left))
+
+    if not args.apply:
+        print("dry run, nothing changed; add --apply (mode %s)" % args.mode)
+    else:
+        for c, store, name in builds:
+            os.makedirs(store, exist_ok=True)
+            build(c, store, name, args.mode)
+        for slot, rel in links:
+            os.makedirs(os.path.dirname(slot), exist_ok=True)
+            os.symlink(rel, slot)
+        print("created %d dir(s) in the store, %d link(s) in the view" % (len(builds), len(links)))
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
